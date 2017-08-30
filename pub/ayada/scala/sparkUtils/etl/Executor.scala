@@ -1,174 +1,138 @@
 package pub.ayada.scala.sparkUtils.etl
 
-import org.apache.spark.sql.DataFrame
-import org.apache.commons.configuration.PropertiesConfiguration
+import org.apache.spark.SparkContext
+import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.hive.HiveContext
 
-class Executor(sparkContext: org.apache.spark.SparkContext,
-               jobProps: pub.ayada.scala.sparkUtils.etl.JobProps,
-               status: scala.collection.mutable.HashMap[String, Int],
-               maxThread: Int) {
-    private lazy val pool = java.util.concurrent.Executors.newFixedThreadPool(maxThread)
+import org.apache.commons.configuration.PropertiesConfiguration
+import org.apache.spark.storage.StorageLevel
+
+import pub.ayada.scala.sparkUtils.etl.read.ReadProps
+import pub.ayada.scala.sparkUtils.etl.read.jdbc.{ Jdbc2DF, Jdbc2DFProps }
+import pub.ayada.scala.sparkUtils.etl.read.hive.{ Hive2DF, Hive2DFProps }
+import pub.ayada.scala.sparkUtils.etl.read.csv.{ Csv2DF, Csv2DFProps }
+
+import pub.ayada.scala.sparkUtils.etl.write.WriteProps
+import pub.ayada.scala.sparkUtils.etl.write.hive.{ DF2Hive, DF2HiveProps }
+import pub.ayada.scala.sparkUtils.etl.write.parquet.{ DF2Parquet, DF2ParquetProps }
+
+import pub.ayada.scala.sparkUtils.etl.transform.{ Transformer, TransformerDFs, TransformerProps }
+
+import pub.ayada.scala.utils.DateTimeUtils
+
+class Executor(sparkContext : SparkContext,
+               jobProps : JobProps,
+               defaults : scala.collection.mutable.Map[String, String],
+               status : scala.collection.mutable.HashMap[String, Int]) {
+    //private lazy val pool = java.util.concurrent.Executors.newFixedThreadPool(maxThread)
     val jobId = "Executor-" + jobProps.id
-    val sqlContext = new org.apache.spark.sql.SQLContext(sparkContext)
+    val sqlContext = new SQLContext(sparkContext)
+
+    import sqlContext.udf
     import sqlContext.sql
     import sqlContext.implicits._
     import org.apache.spark.sql._
 
-    val hiveContext = new org.apache.spark.sql.hive.HiveContext(sparkContext)
+    val hiveContext = new HiveContext(sparkContext)
     import hiveContext.sql
     import hiveContext.implicits._
 
     def process() {
         try {
-            var dfs: scala.collection.mutable.Map[String, (DataFrame, Boolean)] = scala.collection.mutable.Map()
+            var dfs : scala.collection.mutable.Map[String, TransformerDFs] = scala.collection.mutable.Map()
 
             for (r <- jobProps.readProps) {
-                r.getClass.getName match {
-                    case "pub.ayada.scala.sparkUtils.Jdbc2DFProps" => {
-                        println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "HiveContext: " + hiveContext.toString)
-                        new pub.ayada.scala.sparkUtils.etl.Jdbc2DF(sqlContext, hiveContext, r.asInstanceOf[pub.ayada.scala.sparkUtils.etl.Jdbc2DFProps], dfs).execute
+                r._1.toLowerCase match {
+                    case "jdbc" => {
+                        new Jdbc2DF(jobProps.id, sqlContext, hiveContext, defaults, r._2.asInstanceOf[Jdbc2DFProps], dfs).execute
                     }
-                    case "pub.ayada.scala.sparkUtils.Csv2DFProps" => {
-                        println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "HiveContext: " + hiveContext.toString)
-                        //pool.execute(new pub.ayada.scala.sparkUtils.Csv2DF(hiveContext, r.asInstanceOf[Csv2DFProps], dfs))
-                        new pub.ayada.scala.sparkUtils.etl.Csv2DF(hiveContext, r.asInstanceOf[pub.ayada.scala.sparkUtils.etl.Csv2DFProps], dfs).execute
+                    case "hive" => {
+                        new Hive2DF(jobProps.id, hiveContext, defaults, r._2.asInstanceOf[Hive2DFProps], dfs).execute
+                    }
+                    case "csv" => {
+                        new Csv2DF(jobProps.id, hiveContext, defaults, r._2.asInstanceOf[Csv2DFProps], dfs).execute
                     }
                     case _ =>
-                        println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "Err:Task ignored as the associated load type is currently not supported. Type:" + r.toString())
+                        println(DateTimeUtils.getFmtDtm(jobId) + "Err:Task ignored as the associated load type is currently not supported. Type:" + r.toString())
                 }
             }
-
+            /*
             pool.shutdown();
             while (!pool.isTerminated()) {
                 Thread.sleep(5000)
             }
+*/
 
+            /*            var tup : (String, TransformerDFs) = null
             for (r <- jobProps.readProps) {
-                r.getClass.getName match {
-                    case "pub.ayada.scala.sparkUtils.Jdbc2DFProps" => {
-                        val id = r.asInstanceOf[Jdbc2DFProps].id
-                        val tup = dfs.getOrElse(id, null)
-                        if (null != tup) {
-                            tup._1.registerTempTable(id)
-                        }
-                    }
-                    case "pub.ayada.scala.sparkUtils.Csv2DFProps" => {
-                        val id = r.asInstanceOf[Csv2DFProps].id
-                        val tup = dfs.getOrElse(id, null)
-                        if (null != tup) {
-                            tup._1.registerTempTable(id)
-                        }
-                    }
-                }
+                var transformerDFs = dfs.getOrElse(r._2.id, null)
+                if (null != transformerDFs)
+                    transformerDFs.df.registerTempTable(r._2.id)
             }
-
+*/
             if (dfs.size > 0) {
-                runTransforms(jobProps.id, jobProps.transformProps, dfs)
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "List of DFs: " + dfs.keySet.mkString(","))
-                storeAndUnpersitDFs(dfs, jobProps.dF2HiveProps)
+                var pending : scala.collection.mutable.ListBuffer[TransformerProps] = Transformer.runTransforms(jobProps.id, hiveContext, jobProps.transformProps, defaults, dfs)
+                while (pending.size > 0) {
+                    pending = Transformer.runTransforms(jobProps.id, hiveContext, pending.toList, defaults, dfs)
+                }
+
+                println(DateTimeUtils.getFmtDtm(jobId) + "List of DFs: " + dfs.keySet.mkString(",") + "\n")
+                storeAndUnpersitDFs(dfs, jobProps.writeProps)
                 unpersitDFs(dfs, jobProps.transformProps)
             } else {
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "Err: Nothing to load as no DataFrames were created.")
+                println(DateTimeUtils.getFmtDtm(jobId) + "Err: Nothing to load as no DataFrames were created.")
             }
 
         } catch {
-            case e: Exception =>
+            case e : Exception =>
                 val sb = new StringBuilder(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId))
                 sb.append(e).append("\nStackTrace:\n")
-                for (element: StackTraceElement <- e.getStackTrace()) {
+                for (element : StackTraceElement <- e.getStackTrace()) {
                     sb.append(element.toString());
                     sb.append("\n");
                 }
                 println(sb.toString)
                 status.put(jobProps.id, 1)
         } finally {
-            println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "Processing ended")
+            println(DateTimeUtils.getFmtDtm(jobId) + "Processing ended")
             Thread.`yield`
         }
     }
 
-    def runTransforms(jobId: String, props: List[pub.ayada.scala.sparkUtils.etl.TransformerProps],
-                      dfs: scala.collection.mutable.Map[String, (org.apache.spark.sql.DataFrame, Boolean)]) = {
-        props.foreach(prop => {
-            val df = dfs.getOrElse(prop.srcDF, null)
-            val taskID = jobId + "-" + prop.id
+    def storeAndUnpersitDFs(dfs : scala.collection.mutable.Map[String, TransformerDFs],
+                            writeProps : List[(String, WriteProps)]) {
+        println(DateTimeUtils.getFmtDtm(jobId) + "Starting Hive load. Number tables to load:" + writeProps.size)
+        writeProps.foreach(hp => {
+            println(DateTimeUtils.getFmtDtm(jobId + "-" + hp._2.srcDF) + "Preparing for hive load id:" + hp._2.id + ", Source DF:" + hp._2.srcDF)
 
-            if (null != df && df._1 != null) {
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + "Running Transformarmation: " + pub.ayada.scala.utils.ObjectUtils.prettyPrint(prop))
-                if (df._2) {
-                    println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + "Number of records in the DF: " + prop.srcDF + " is " + df._1.count)
-                    dfs.update(prop.srcDF, (df._1, false))
-                }
-                val df2 = prop.typ match {
-                    case "filter" => {
-
-                        df._1.filter(prop.conditionExpr).alias(prop.id)
-                    }
-                    case "sql" => {
-                        hiveContext.sql(prop.conditionExpr).alias(prop.id)
-                    }
-                    case _ => throw new Exception("Unknown transformation type received (valid:filter|sql) : " + prop.typ)
-                }
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + " Registering DF as " + prop.id)
-                try {
-
-                    df2.registerTempTable(prop.id)
-                } catch {
-                    case t: Throwable => {
-                        println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + " Failed to register " + prop.id)
-                        t.printStackTrace()
-                    }
-                }
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + "Number of records in the DF: " + prop.srcDF + " is " + df2.count)
-
-                if (prop.printSchema) {
-                    println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + "DF schema of : " + prop.id + "\n\t\t" + df2.schema.simpleString)
-                }
-                if (prop.cache) {
-                    println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + " Caching the DF " + prop.id)
-                    df2.cache()
-                }
-                if (prop.persist) {
-                    println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + " Persisting the DF " + prop.id + " with StorageLevel.MEMORY_AND_DISK")
-                    df2.persist(org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK)
-                }
-
-                dfs.put(prop.id, (df2, prop.loadCount))
-
+            val d : TransformerDFs = dfs.getOrElse(hp._2.srcDF, null)
+            if (d.df == null) {
+                println(DateTimeUtils.getFmtDtm(jobId + "-" + hp._2.srcDF) + "Err: '" + hp._2.srcDF + "' is null. Not writing to destination: " + hp._1)
             } else {
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm("Transformer-" + taskID) + "Wrn: Empty DataFrame: " + prop.srcDF)
-            }
-
-        })
-    }
-
-    def storeAndUnpersitDFs(dfs: scala.collection.mutable.Map[String, (DataFrame, Boolean)],
-                            dF2HiveProps: List[pub.ayada.scala.sparkUtils.etl.DF2HiveProps]) {
-        println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "Starting Hive load. Number tables to load:" + dF2HiveProps.size)
-        dF2HiveProps.foreach(hp => {
-            println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId + "-" + hp.srcDF) + "Preparing for hive load id:" + hp.id + ", Source DF:" + hp.srcDF)
-
-            val d: (DataFrame, Boolean) = dfs.getOrElse(hp.srcDF, (null, false))
-            if (d._1 == null) {
-                println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId + "-" + hp.srcDF) + "Err: '" + hp.srcDF + "' is null. Not writing to table : " + hp.schema + "." + hp.table)
-            } else {
-                DF2Hive.write2Hive(jobId + "-" + hp.srcDF, hiveContext, hp, d)
-                dfs.update(hp.srcDF, (d._1, false))
+                hp._2 match {
+                    case DF2HiveProps(taskType, id, srcDF, loadType, schema, table, format, partitionColumns, preLoadCount, postLoadCount) =>
+                        DF2Hive.write2Hive(id, hiveContext, hp._2.asInstanceOf[DF2HiveProps], d)
+                    case DF2ParquetProps(taskType, id, srcDF, loadType, fileDir, partitionColumns, preLoadCount, postLoadCount) =>
+                        DF2Parquet.write2Parquet(id, hiveContext, hp._2.asInstanceOf[DF2ParquetProps], d)
+                }
+                d.loadCount = false
             }
         })
     }
 
-    def unpersitDFs(dfs: scala.collection.mutable.Map[String, (DataFrame, Boolean)],
-                    transformProps: List[pub.ayada.scala.sparkUtils.etl.TransformerProps]) {
-        println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "Starting to unpersist DataFrames")
-        transformProps.foreach(p => {
-            val df: (DataFrame, Boolean) = dfs.getOrElse(p.id, (null, false))
-            if (df != null) {
+    def unpersitDFs(dfs : scala.collection.mutable.Map[String, TransformerDFs],
+                    transformProps : List[TransformerProps]) {
+        println(DateTimeUtils.getFmtDtm(jobId) + "Starting to unpersist DataFrames")
+
+        for (k <- dfs.keys) {
+            val df : TransformerDFs = dfs.getOrElse(k, null)
+            if (df != null & df.df != null) {
                 try {
-                    println(pub.ayada.scala.utils.DateTimeUtils.getFmtDtm(jobId) + "Unpersisting: " + p.id)
-                    df._1.unpersist()
-                } catch { case t: Throwable => }
+                    println(DateTimeUtils.getFmtDtm(jobId) + "Unpersisting: " + k)
+                    df.df.unpersist()
+                } catch { case t : Throwable => }
             }
-        })
+
+        }
     }
 }
