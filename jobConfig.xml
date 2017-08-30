@@ -1,12 +1,61 @@
-<jobs appName="JDBC2Hive" maxNumberOfThreads="10">
-<jdbc2hive id="all_tables">
-    <jdbc propsFile="/user/k-ayada/prod.properties" fetchSize="100000" isolationLevel="READ_COMMIT">
-        <sql><![CDATA[select * from PROD.all_tables ]]> </sql>
-    </jdbc>
-    <hive loadType="append" schema="kayada" table="all_tables" partitionKey="SK_EFFDATE" noOfPartitions="7" lowerBound="" upperBound="" />
-</jdbc2hive>
-<jdbc2hive id="ALL_OBJECTS">
-    <jdbc propsFile="/user/k-ayada/prod.properties" schema="PROD" table="ALL_OBJECTS"  fetchSize="100000" isolationLevel="READ_COMMIT"/>
-    <hive loadType="overwrite" schema="kayada" table="ALL_OBJECTS" partitionKey="" noOfPartitions="7" lowerBound="" upperBound="" />
-</jdbc2hive>
-<jobs>
+<jobs appName="JDBC2Hive" maxNumberOfThreads="10" defaultNoOfPartitions="10">
+    <job>    
+         <src>   
+               <hive id="GLOBAL_IPS" propsFile=""
+                     schema=""
+                     table=""
+                     repartition="0"
+                     printSchema="true"
+	    	         broadcast="false"
+                     loadCount="false"
+                     printSchema="true"
+                     forceNoPersist="true">
+                     <sql><![CDATA[ SELECT IP,LATITUE,longitude from GLOBAL_IPS ]]> </sql>
+               </hive>
+               <jdbc id="GEO_POINT" propsFile="***must contain JDBCUrl,JDBCDriver,JDBCUser,JDBCPassword/JDBCPasswordAlias**"
+                     schema=""
+                     table=""
+                     repartition="0"
+                     printSchema="true"
+	    	         broadcast="true"
+                     loadCount="false"
+                     fetchSize="10000"
+                     isolationLevel ="READ_COMMIT"
+                     partitionKey="seq"
+                     noOfPartitions="50"
+                     lowerBound=""
+                     upperBound=""
+                     printSchema="true"
+                     forceNoPersist="true" >
+                     <sql><![CDATA[ SELECT seq, region, frm_LATITUE, to_LATITUE, frm_longitude, to_longitude from GEO_POINT ]]> </sql>
+             </jdbc>             
+         </src>
+         <transformers>
+                <transformer id="GLOBAL_IP_POINTS"
+                             srcDF="GEO_POINT,GLOBAL_IPS"
+                             type="sql"
+                             registerTempTable="true"
+                             persist="DISK_ONLY_2"
+                             loadCount="false"
+                             printSchema="false" >
+                     <![CDATA[ SELECT IP.IP,IP.LATITUE,IP.longitude, PO.region
+                                 from GLOBAL_IPS IP, GLOBAL_IP_POINTS PO 
+                                WHERE IP.LATITUE   BETWEEN  PO.frm_LATITUE   AND PO.TO_LATITUE 
+                                  AND IP.longitude BETWEEN  PO.frm_longitude AND PO.TO_longitude                      
+                     ]]>
+                </transformer>
+         </transformers>
+         <target>
+            <hive id="GLOBAL_IP_WITH_REGION"
+                  type="hive"
+                  srcDF="OPER__ALL_EVENT_NOTE"
+                  loadType="append"
+	              schema="DEFAULT"
+                  table="GLOBAL_IP_WITH_REGION"
+                  format="parquet"
+                  partitionColumns="region,latitude"
+                  preloadCount="false"
+                  postloadCount="true" />             
+         </target>
+    </job>
+</jobs>
